@@ -7,7 +7,7 @@ use clap::ArgAction::{Set, SetTrue};
 use fs_err as fs;
 use spacetimedb_codegen::{
     generate, generate_receiver_bindings, private_table_names, CodegenOptions, CodegenVisibility, Csharp,
-    ImportExtension, Lang, OutputFile, ReceiverLanguage, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX,
+    ImportExtension, Kotlin, Lang, OutputFile, ReceiverLanguage, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX,
 };
 use spacetimedb_lib::de::serde::DeserializeWrapper;
 use spacetimedb_lib::RawModuleDef;
@@ -20,6 +20,7 @@ use crate::spacetime_config::{
     find_and_load_with_env, CommandConfig, CommandSchema, CommandSchemaBuilder, Key, LoadedConfig, SpacetimeConfig,
 };
 use crate::tasks::csharp::dotnet_format;
+use crate::tasks::kotlin::ktfmt;
 use crate::tasks::rust::rustfmt;
 use crate::util::{detect_module_language, ModuleLanguage, YesOrNo};
 use crate::Config;
@@ -544,6 +545,7 @@ fn prepare_generate_run_configs<'a>(
             let default_dir = match lang {
                 Language::Rust | Language::TypeScript => "src/remote_bindings",
                 Language::Csharp | Language::Cpp => "remote_bindings",
+                Language::Kotlin => anyhow::bail!("Kotlin is a client binding target"),
                 Language::UnrealCpp => unreachable!("Unreal module bindings rejected above"),
             };
             command_config
@@ -608,6 +610,9 @@ fn detect_default_language(client_project_dir: &Path) -> anyhow::Result<Language
     if client_project_dir.join("Cargo.toml").exists() {
         return Ok(Language::Rust);
     }
+    if client_project_dir.join("build.gradle.kts").exists() || client_project_dir.join("build.gradle").exists() {
+        return Ok(Language::Kotlin);
+    }
     if let Ok(entries) = fs::read_dir(client_project_dir)
         && entries
             .flatten()
@@ -627,6 +632,7 @@ fn language_cli_name(lang: Language) -> &'static str {
     match lang {
         Language::Rust => "rust",
         Language::Csharp => "csharp",
+        Language::Kotlin => "kotlin",
         Language::TypeScript => "typescript",
         Language::UnrealCpp => "unrealcpp",
         Language::Cpp => "cpp",
@@ -637,6 +643,7 @@ pub fn default_out_dir_for_language(lang: Language) -> Option<PathBuf> {
     match lang {
         Language::Rust | Language::TypeScript => Some(PathBuf::from("src/module_bindings")),
         Language::Csharp => Some(PathBuf::from("module_bindings")),
+        Language::Kotlin => Some(PathBuf::from("module_bindings")),
         Language::UnrealCpp | Language::Cpp => None,
     }
 }
@@ -784,6 +791,7 @@ pub async fn run_prepared_generate_configs(
                     namespace: &run.namespace,
                 },
                 Language::Cpp => ReceiverLanguage::Cpp,
+                Language::Kotlin => anyhow::bail!("Kotlin is a client binding target"),
                 Language::UnrealCpp => anyhow::bail!("Unreal C++ is a client binding target"),
             };
             let files = generate_receiver_bindings(&module, lang, run.dependency_name.as_deref())?;
@@ -818,6 +826,7 @@ pub async fn run_prepared_generate_configs(
                     &unreal_cpp_lang as &dyn Lang
                 }
                 Language::Rust => &Rust,
+                Language::Kotlin => &Kotlin,
                 Language::TypeScript => {
                     typescript_lang = TypeScript {
                         import_extension: run.import_extension.unwrap_or_default(),
@@ -1026,6 +1035,7 @@ impl BindingKind {
 #[serde(rename_all = "lowercase")]
 pub enum Language {
     Csharp,
+    Kotlin,
     TypeScript,
     Rust,
     #[serde(alias = "c++", alias = "cxx")]
@@ -1036,11 +1046,19 @@ pub enum Language {
 
 impl clap::ValueEnum for Language {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Csharp, Self::TypeScript, Self::Rust, Self::Cpp, Self::UnrealCpp]
+        &[
+            Self::Csharp,
+            Self::Kotlin,
+            Self::TypeScript,
+            Self::Rust,
+            Self::Cpp,
+            Self::UnrealCpp,
+        ]
     }
     fn to_possible_value(&self) -> Option<PossibleValue> {
         Some(match self {
             Self::Csharp => clap::builder::PossibleValue::new("csharp").aliases(["c#", "cs"]),
+            Self::Kotlin => clap::builder::PossibleValue::new("kotlin").aliases(["kt", "KT"]),
             Self::TypeScript => clap::builder::PossibleValue::new("typescript").aliases(["ts", "TS"]),
             Self::Rust => clap::builder::PossibleValue::new("rust").aliases(["rs", "RS"]),
             Self::Cpp => PossibleValue::new("cpp").aliases(["c++", "cxx"]),
@@ -1055,6 +1073,7 @@ impl Language {
         match self {
             Language::Rust => "Rust",
             Language::Csharp => "C#",
+            Language::Kotlin => "Kotlin",
             Language::TypeScript => "TypeScript",
             Language::UnrealCpp => "Unreal C++",
             Language::Cpp => "C++",
@@ -1065,6 +1084,7 @@ impl Language {
         match self {
             Language::Rust => rustfmt(generated_files)?,
             Language::Csharp => dotnet_format(project_dir, generated_files)?,
+            Language::Kotlin => ktfmt(generated_files)?,
             Language::TypeScript => {
                 // TODO: implement formatting.
             }

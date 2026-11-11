@@ -1,0 +1,6 @@
+[toolchain]
+# Keep in sync with the repository's root rust-toolchain.toml.
+channel = "1.97.1"
+profile = "default"
+targets = ["wasm32-unknown-unknown"]
+components = ["rust-src"]

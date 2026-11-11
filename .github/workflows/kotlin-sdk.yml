@@ -1,0 +1,130 @@
+name: Community Kotlin SDK
+
+on:
+  push:
+    branches: [integration/kotlin-sdk-master]
+    paths: ["sdks/kotlin/**", "crates/codegen/**", "crates/cli/**", "rust-toolchain.toml", "Cargo.lock", ".github/workflows/kotlin-sdk.yml"]
+  pull_request:
+    paths: ["sdks/kotlin/**", "crates/codegen/**", "crates/cli/**", "rust-toolchain.toml", "Cargo.lock", ".github/workflows/kotlin-sdk.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kotlin-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  jvm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests
+        working-directory: sdks/kotlin
+        run: ./gradlew :spacetimedb-sdk:jvmTest --no-configuration-cache
+      - name: Build CLI and stock server
+        run: cargo build --locked -p spacetimedb-cli -p spacetimedb-standalone
+      # The submodule fixture is a TypeScript module, built against the in-repo SDK.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - uses: ./.github/actions/setup-pnpm
+      - name: Install TypeScript submodule fixture
+        run: |
+          pnpm install --filter "sdk-test-module..." --filter spacetimedb
+          pnpm --filter spacetimedb build
+      - name: Codegen snapshot and submodule naming
+        run: cargo test --locked -p spacetimedb-codegen --test codegen kotlin
+      - name: Submodule bindings against a live server
+        run: python3 sdks/kotlin/scripts/live_tests.py submodules
+      - name: Generated bindings and live server tests
+        run: python3 sdks/kotlin/scripts/live_tests.py jvm
+      - name: Publish local JVM artifacts and plugin
+        working-directory: sdks/kotlin
+        run: |
+          ./gradlew :spacetimedb-sdk:publishKotlinMultiplatformPublicationToMavenLocal :spacetimedb-sdk:publishJvmPublicationToMavenLocal --no-configuration-cache
+          ./gradlew -p spacetimedb-gradle-plugin publishToMavenLocal --no-configuration-cache
+      - name: Independent Maven-local consumer
+        working-directory: sdks/kotlin
+        run: ./gradlew -p examples/local-consumer run --no-configuration-cache
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kotlin-jvm-reports
+          path: sdks/kotlin/**/build/reports/tests/
+
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI and stock server
+        run: cargo build --locked -p spacetimedb-cli -p spacetimedb-standalone
+      - name: Select an available iPhone simulator
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, os
+          data = json.loads(subprocess.check_output(['xcrun', 'simctl', 'list', 'devices', 'available', '-j']))
+          device = next(d for group in data['devices'].values() for d in group if d['name'].startswith('iPhone'))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('IOS_SIMULATOR_ID=' + device['udid'] + '\n')
+          PY
+      - name: Native unit tests
+        working-directory: sdks/kotlin
+        run: ./gradlew :spacetimedb-sdk:iosSimulatorArm64Test -PiosSimulatorId="$IOS_SIMULATOR_ID" --no-configuration-cache
+      - name: Darwin live networking
+        run: python3 sdks/kotlin/scripts/live_tests.py ios --ios-id "$IOS_SIMULATOR_ID"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kotlin-ios-reports
+          path: sdks/kotlin/**/build/reports/tests/
+
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI and stock server
+        run: cargo build --locked -p spacetimedb-cli -p spacetimedb-standalone
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_7
+          disable-animations: true
+          script: python3 sdks/kotlin/scripts/live_tests.py android

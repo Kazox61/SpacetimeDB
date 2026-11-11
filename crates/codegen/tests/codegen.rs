@@ -1,5 +1,6 @@
 use spacetimedb_codegen::{
-    generate, generate_receiver_bindings, CodegenOptions, Csharp, ImportExtension, ReceiverLanguage, Rust, TypeScript,
+    generate, generate_receiver_bindings, CodegenOptions, Csharp, ImportExtension, Kotlin, ReceiverLanguage, Rust,
+    TypeScript,
 };
 use spacetimedb_data_structures::map::HashMap;
 use spacetimedb_schema::def::ModuleDef;
@@ -77,6 +78,7 @@ macro_rules! declare_tests {
             // Ignore the place where the CLI version is put in the typescript REMOTE_MODULE info,
             // so it isn't constantly changing.
             settings.add_filter(r#"cliVersion: "\d+\.\d+\.\d+","#, r#"cliVersion: "X.Y.Z","#);
+            settings.add_filter(r#"override val cliVersion: String = "\d+\.\d+\.\d+[^"]*""#, r#"override val cliVersion: String = "X.Y.Z""#);
             settings.bind(|| {
                 insta::assert_toml_snapshot!(outfiles);
             });
@@ -87,6 +89,7 @@ macro_rules! declare_tests {
 declare_tests! {
     test_codegen_csharp => Csharp { namespace: "SpacetimeDB" },
     test_codegen_typescript => TypeScript::default(),
+    test_codegen_kotlin => Kotlin,
     test_codegen_rust => Rust,
 }
 
@@ -339,6 +342,72 @@ fn submodule_names_use_canonical_wire_names_and_accessor_paths() {
         filenames.iter().any(|f| f.starts_with("myLib/")) && !filenames.iter().any(|f| f.starts_with("my_lib/")),
         "generated files must live under the accessor namespace directory; got {filenames:?}"
     );
+}
+
+/// Kotlin counterpart of [`submodule_names_use_canonical_wire_names_and_accessor_paths`]:
+/// a submodule lives in its own package, named after its accessor path, and is reachable
+/// from the root accessors, while every name sent to the server stays canonical.
+#[test]
+fn kotlin_submodule_uses_accessor_package_and_canonical_wire_names() {
+    let module = compiled_typescript_module();
+    let files: HashMap<_, _> = generate(module, &Kotlin, &CodegenOptions::default())
+        .into_iter()
+        .map(|f| (f.filename, f.code))
+        .collect();
+    let file = |name: &str| {
+        files
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}; got {:?}", files.keys().collect::<Vec<_>>()))
+    };
+
+    for (name, code) in &files {
+        let package = match name.rsplit_once('/') {
+            Some((dir, _)) => format!("package module_bindings.{}", dir.replace('/', ".")),
+            None => "package module_bindings".to_owned(),
+        };
+        assert!(
+            code.lines().any(|l| l == package),
+            "{name} must declare `{package}` to match its directory"
+        );
+    }
+    assert!(
+        !files.keys().any(|f| f.starts_with("my_lib/")),
+        "files belong under the accessor namespace"
+    );
+
+    // Each submodule defines its own types, so equal names in the root and the submodule
+    // (both define `EnvSqlRow`) must not collide.
+    assert!(file("myLib/Types.kt").contains("data class LibData("));
+    assert!(file("myLib/Types.kt").contains("data class EnvSqlRow("));
+    assert!(file("Types.kt").contains("data class EnvSqlRow("));
+    assert!(!file("Types.kt").contains("data class LibData("));
+
+    // Wire names are canonical and qualified once; client-facing names use the accessor.
+    let lib_table = file("myLib/LibDataTableHandle.kt");
+    assert!(lib_table.contains(r#"const val TABLE_NAME = "my_lib.libData""#));
+    assert!(file("myLib/LibInsertReducer.kt").contains(r#"const val REDUCER_NAME = "my_lib.lib_insert""#));
+    assert!(file("myLib/LibCountProcedure.kt").contains(r#"const val PROCEDURE_NAME = "my_lib.lib_count""#));
+    for code in files.values() {
+        assert!(!code.contains("my_lib.my_lib.") && !code.contains("\"myLib."));
+    }
+
+    // Root accessors expose the submodule under its accessor name.
+    let root_tables = file("RemoteTables.kt");
+    assert!(root_tables.contains("val myLib: module_bindings.myLib.RemoteTables"));
+    assert!(file("myLib/RemoteTables.kt").contains("val libData: LibDataTableHandle"));
+    assert!(file("RemoteReducers.kt").contains("val myLib: module_bindings.myLib.RemoteReducers"));
+    assert!(file("myLib/RemoteReducers.kt").contains("fun libInsert(value: String"));
+    assert!(file("RemoteProcedures.kt").contains("val myLib: module_bindings.myLib.RemoteProcedures"));
+    assert!(file("myLib/RemoteProcedures.kt").contains("fun libCount("));
+
+    // The root module registers, names and subscribes to submodule tables.
+    let root_module = file("Module.kt");
+    assert!(root_module.contains("cache.register(module_bindings.myLib.LibDataTableHandle.TABLE_NAME"));
+    assert!(root_module.contains(r#""my_lib.libData","#));
+    assert!(root_module.contains(r#""my_lib.lib_insert","#));
+    assert!(root_module.contains("val myLib = module_bindings.myLib.QueryBuilder()"));
+    assert!(root_module.contains("addQuery(qb.myLib.libData().toSql())"));
+    assert!(file("myLib/QueryBuilder.kt").contains(r#"Table("my_lib.libData""#));
 }
 
 #[test]
@@ -770,4 +839,79 @@ fn test_codegen_typescript_receiver_bindings() {
             assert!(!code.contains(&format!("__t.{constructor}(\"{name}\"")));
         }
     }
+}
+
+/// A root module mounting `outerLib`, which in turn mounts `innerLib`; each level has a table,
+/// and the inner level also has a reducer and a procedure.
+fn nested_submodule_module() -> ModuleDef {
+    use spacetimedb_lib::db::raw_def::v10::{RawModuleDefV10Builder, RawModuleDefV10Section, RawSubmoduleV10};
+    use spacetimedb_lib::sats::{AlgebraicType, ProductType};
+
+    let mut inner = RawModuleDefV10Builder::new();
+    inner
+        .build_table_with_new_type("innerData", ProductType::from([("id", AlgebraicType::U64)]), true)
+        .with_access(spacetimedb_lib::db::raw_def::v9::TableAccess::Public)
+        .finish();
+    inner.add_reducer("inner_insert", ProductType::from([("id", AlgebraicType::U64)]));
+    inner.add_procedure("inner_count", ProductType::unit(), AlgebraicType::U64);
+
+    let mut outer = RawModuleDefV10Builder::new();
+    outer
+        .build_table_with_new_type("outerData", ProductType::from([("id", AlgebraicType::U64)]), true)
+        .with_access(spacetimedb_lib::db::raw_def::v9::TableAccess::Public)
+        .finish();
+    let mut outer = outer.finish();
+    outer
+        .sections
+        .push(RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+            namespace: "innerLib".to_owned(),
+            module: inner.finish(),
+        }]));
+
+    let mut root = RawModuleDefV10Builder::new().finish();
+    root.sections
+        .push(RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+            namespace: "outerLib".to_owned(),
+            module: outer,
+        }]));
+    root.try_into().expect("nested submodule fixture should validate")
+}
+
+/// Submodules nest: each level gets its own package and is reachable from its parent,
+/// and wire names carry the full canonical path, qualified exactly once.
+#[test]
+fn kotlin_nested_submodules_chain_packages_and_accessors() {
+    let files: HashMap<_, _> = generate(&nested_submodule_module(), &Kotlin, &CodegenOptions::default())
+        .into_iter()
+        .map(|f| (f.filename, f.code))
+        .collect();
+    let file = |name: &str| {
+        files
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}; got {:?}", files.keys().collect::<Vec<_>>()))
+    };
+
+    assert!(file("outerLib/innerLib/InnerDataTableHandle.kt").contains("package module_bindings.outerLib.innerLib"));
+    assert!(file("outerLib/innerLib/InnerDataTableHandle.kt")
+        .contains(r#"const val TABLE_NAME = "outer_lib.inner_lib.inner_data""#));
+    assert!(file("outerLib/innerLib/InnerInsertReducer.kt")
+        .contains(r#"const val REDUCER_NAME = "outer_lib.inner_lib.inner_insert""#));
+    assert!(file("outerLib/innerLib/InnerCountProcedure.kt")
+        .contains(r#"const val PROCEDURE_NAME = "outer_lib.inner_lib.inner_count""#));
+
+    // Each level links to the next one.
+    assert!(file("RemoteTables.kt").contains("val outerLib: module_bindings.outerLib.RemoteTables"));
+    assert!(file("outerLib/RemoteTables.kt").contains("val innerLib: module_bindings.outerLib.innerLib.RemoteTables"));
+    assert!(file("outerLib/RemoteReducers.kt")
+        .contains("module_bindings.outerLib.innerLib.RemoteReducers(conn, reportUnhandled)"));
+    assert!(file("outerLib/RemoteReducers.kt").contains("return innerLib.handleReducerEvent(ctx)"));
+    assert!(
+        file("outerLib/QueryBuilder.kt").contains("val innerLib = module_bindings.outerLib.innerLib.QueryBuilder()")
+    );
+
+    // The root module covers every level.
+    let root_module = file("Module.kt");
+    assert!(root_module.contains(r#""outer_lib.inner_lib.inner_data","#));
+    assert!(root_module.contains("cache.register(module_bindings.outerLib.innerLib.InnerDataTableHandle.TABLE_NAME"));
+    assert!(root_module.contains("addQuery(qb.outerLib.innerLib.innerData().toSql())"));
 }
