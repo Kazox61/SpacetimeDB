@@ -2,7 +2,7 @@
 agp = "9.1.0"
 android-compileSdk = "36"
 android-minSdk = "26"
-kotlin = "2.3.10"
+kotlin = "2.3.21"
 kotlinx-coroutines = "1.10.2"
 kotlinxAtomicfu = "0.31.0"
 kotlinxCollectionsImmutable = "0.4.0"

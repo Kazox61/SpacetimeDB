@@ -80,7 +80,12 @@ internal class SpacetimeTransport(
 
         val session = client.webSocketSession(wsUrl) {
             // Servers that predate v3 select v2.
-            header("Sec-WebSocket-Protocol", "$WS_PROTOCOL_V3, $WS_PROTOCOL")
+            if (browserWebSocket) {
+                headers.append("Sec-WebSocket-Protocol", WS_PROTOCOL_V3)
+                headers.append("Sec-WebSocket-Protocol", WS_PROTOCOL)
+            } else {
+                header("Sec-WebSocket-Protocol", "$WS_PROTOCOL_V3, $WS_PROTOCOL")
+            }
             if (authToken != null) {
                 header("Authorization", "Bearer $authToken")
             }
