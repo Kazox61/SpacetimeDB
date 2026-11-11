@@ -269,6 +269,23 @@ class ConnectionLifecycleTest {
         conn.disconnect()
     }
 
+    @Test
+    fun `a configured token is reported on connect, not the server's echo of it`() = runTest {
+        // In the browser the connection presents a short-lived token, and the server echoes that one.
+        val transport = FakeTransport()
+        var reported: String? = null
+        val conn = createTestConnection(transport, onConnect = { _, _, token -> reported = token }, initialToken = "long-lived")
+        conn.connect()
+        transport.sendToClient(
+            ServerMessage.InitialConnection(identity = TEST_IDENTITY, connectionId = TEST_CONNECTION_ID, token = "short-lived")
+        )
+        advanceUntilIdle()
+
+        assertEquals("long-lived", reported)
+        assertEquals("long-lived", conn.token)
+        conn.disconnect()
+    }
+
     // --- sendMessage after close ---
 
     @Test

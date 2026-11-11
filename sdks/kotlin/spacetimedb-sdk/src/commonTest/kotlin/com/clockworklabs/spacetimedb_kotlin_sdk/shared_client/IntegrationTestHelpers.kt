@@ -43,6 +43,7 @@ internal fun TestScope.createTestConnection(
     moduleDescriptor: ModuleDescriptor? = null,
     callbackDispatcher: kotlinx.coroutines.CoroutineDispatcher? = null,
     exceptionHandler: CoroutineExceptionHandler? = null,
+    initialToken: String? = null,
 ): DbConnection {
     val baseContext = SupervisorJob() + StandardTestDispatcher(testScheduler)
     val context = if (exceptionHandler != null) baseContext + exceptionHandler else baseContext
@@ -56,6 +57,7 @@ internal fun TestScope.createTestConnection(
         stats = Stats(),
         moduleDescriptor = moduleDescriptor,
         callbackDispatcher = callbackDispatcher,
+        initialToken = initialToken,
     )
 }
 

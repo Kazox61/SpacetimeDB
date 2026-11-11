@@ -10,6 +10,10 @@ import com.clockworklabs.spacetimedb_kotlin_sdk.shared_client.protocol.ServerMes
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.websocket.webSocketSession
 import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.HttpHeaders
+import io.ktor.http.isSuccess
 import io.ktor.http.URLBuilder
 import io.ktor.http.URLProtocol
 import io.ktor.http.Url
@@ -67,27 +71,33 @@ internal class SpacetimeTransport(
 
         /** Close code the server sends when another live connection still holds [sessionId]. */
         const val SESSION_BUSY_CLOSE_CODE: Short = 4000
+
+        /** The `{"token": "…"}` body of `POST /v1/identity/websocket-token`. */
+        private val WEBSOCKET_TOKEN = Regex("\"token\"\\s*:\\s*\"([^\"]+)\"")
     }
 
 
 
     /**
      * Connects to the SpacetimeDB WebSocket endpoint.
-     * Passes the auth token as a Bearer Authorization header on the WebSocket connection.
+     * Passes the auth token as a Bearer Authorization header on the WebSocket connection. The
+     * browser's WebSocket can't carry headers, so there the token is first traded for a short-lived
+     * one that goes in the URL, as the TypeScript SDK does.
      */
     override suspend fun connect() {
-        val wsUrl = buildWsUrl()
-
-        val session = client.webSocketSession(wsUrl) {
-            // Servers that predate v3 select v2.
-            if (browserWebSocket) {
-                headers.append("Sec-WebSocket-Protocol", WS_PROTOCOL_V3)
-                headers.append("Sec-WebSocket-Protocol", WS_PROTOCOL)
-            } else {
-                header("Sec-WebSocket-Protocol", "$WS_PROTOCOL_V3, $WS_PROTOCOL")
-            }
-            if (authToken != null) {
-                header("Authorization", "Bearer $authToken")
+        val session = networkFailuresAsExceptions {
+            val wsUrl = buildWsUrl(if (browserWebSocket && authToken != null) websocketToken(authToken) else null)
+            client.webSocketSession(wsUrl) {
+                // Servers that predate v3 select v2.
+                if (browserWebSocket) {
+                    headers.append("Sec-WebSocket-Protocol", WS_PROTOCOL_V3)
+                    headers.append("Sec-WebSocket-Protocol", WS_PROTOCOL)
+                } else {
+                    header("Sec-WebSocket-Protocol", "$WS_PROTOCOL_V3, $WS_PROTOCOL")
+                }
+                if (authToken != null) {
+                    header("Authorization", "Bearer $authToken")
+                }
             }
         }
         // Incoming frames decode the same way under both protocols, so only outgoing
@@ -107,7 +117,7 @@ internal class SpacetimeTransport(
         message.encode(writer)
         val encoded = writer.toByteArray()
         val ws = _session.value ?: error("Not connected")
-        ws.send(Frame.Binary(true, encoded))
+        networkFailuresAsExceptions { ws.send(Frame.Binary(true, encoded)) }
     }
 
     override suspend fun sendAll(messages: List<ClientMessage>) {
@@ -117,7 +127,7 @@ internal class SpacetimeTransport(
         }
         val ws = _session.value ?: error("Not connected")
         for (frame in encodeClientFrames(messages, MAX_OUTGOING_FRAME_BYTES)) {
-            ws.send(Frame.Binary(true, frame))
+            networkFailuresAsExceptions { ws.send(Frame.Binary(true, frame)) }
         }
     }
 
@@ -130,9 +140,11 @@ internal class SpacetimeTransport(
         // On clean close, the for-loop exits normally (hasNext() returns false).
         // On abnormal close, hasNext() throws the original cause (e.g. IOException),
         // which propagates to DbConnection's error handling path.
-        for (frame in ws.incoming) {
-            if (frame is Frame.Binary) {
-                for (message in decodeServerFrame(frame.readBytes())) emit(message)
+        networkFailuresAsExceptions {
+            for (frame in ws.incoming) {
+                if (frame is Frame.Binary) {
+                    for (message in decodeServerFrame(frame.readBytes())) emit(message)
+                }
             }
         }
         if (ws.closeReason.await()?.code == SESSION_BUSY_CLOSE_CODE) throw SessionBusyException()
@@ -144,7 +156,33 @@ internal class SpacetimeTransport(
         ws?.close()
     }
 
-    private fun buildWsUrl(): String {
+    /**
+     * Ktor's browser engine reports network failures as [Error] (e.g. "Fail to fetch"), which isn't an
+     * [Exception], so connection retries would never see them. In the browser they're rethrown as one.
+     */
+    private inline fun <T> networkFailuresAsExceptions(block: () -> T): T {
+        if (!browserWebSocket) return block()
+        try {
+            return block()
+        } catch (failure: Error) {
+            throw BrowserNetworkException(failure)
+        }
+    }
+
+    /** Trades [token] for a short-lived one the server accepts as the `token` URL parameter. */
+    private suspend fun websocketToken(token: String): String {
+        val base = Url(baseUrl)
+        val url = URLBuilder(base).apply {
+            protocol = if (base.protocol == URLProtocol.WSS || base.protocol == URLProtocol.HTTPS) URLProtocol.HTTPS else URLProtocol.HTTP
+            appendPathSegments("v1", "identity", "websocket-token")
+        }.build()
+        val response = client.post(url) { header(HttpHeaders.Authorization, "Bearer $token") }
+        val body = response.bodyAsText()
+        check(response.status.isSuccess()) { "Exchanging the token for a WebSocket token failed: ${response.status}" }
+        return WEBSOCKET_TOKEN.find(body)?.groupValues?.get(1) ?: error("No token in the websocket-token response")
+    }
+
+    private fun buildWsUrl(websocketToken: String?): String {
         val base = Url(baseUrl)
         return URLBuilder(base).apply {
             protocol = when (base.protocol) {
@@ -168,6 +206,12 @@ internal class SpacetimeTransport(
             if (sessionId != null) {
                 parameters.append("session_id", sessionId.toHexString())
             }
+            if (websocketToken != null) {
+                parameters.append("token", websocketToken)
+            }
         }.buildString()
     }
 }
+
+/** A network failure in the browser; see `networkFailuresAsExceptions`. */
+internal class BrowserNetworkException(cause: Throwable) : Exception(cause.message ?: "Network failure", cause)

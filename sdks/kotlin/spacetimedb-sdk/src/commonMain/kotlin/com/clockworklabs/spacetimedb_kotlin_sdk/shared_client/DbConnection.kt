@@ -146,6 +146,8 @@ public open class DbConnection internal constructor(
     public val stats: Stats,
     internal val moduleDescriptor: ModuleDescriptor?,
     private val callbackDispatcher: CoroutineDispatcher?,
+    /** The configured token, known before connecting so the server's echo of it never replaces it. */
+    initialToken: String? = null,
 ) : DbConnectionView {
     /** Local cache of subscribed table rows, kept in sync with the server. */
     @InternalSpacetimeApi
@@ -174,8 +176,8 @@ public open class DbConnection internal constructor(
     public override val connectionId: ConnectionId?
         get() = _connectionId.value
 
-    private val _token = atomic<String?>(null)
-    /** Authentication token assigned by the server, or `null` before connection. */
+    private val _token = atomic(initialToken)
+    /** The token this connection authenticates with: the configured one, or the one the server assigned. */
     public var token: String?
         get() = _token.value
         private set(value) { _token.value = value }
@@ -615,7 +617,10 @@ public open class DbConnection internal constructor(
                     token = message.token
                 }
                 Logger.info { "Connected with identity=${message.identity}" }
-                for (cb in _onConnectCallbacks) runUserCallback { cb(this, message.identity, message.token) }
+                // The server echoes the token this connection presented. In the browser that's the
+                // short-lived WebSocket token, so report the long-lived one this connection holds.
+                val reported = token ?: message.token
+                for (cb in _onConnectCallbacks) runUserCallback { cb(this, message.identity, reported) }
             }
 
             is ServerMessage.SubscribeApplied -> {
@@ -1009,6 +1014,7 @@ public open class DbConnection internal constructor(
                 stats = stats,
                 moduleDescriptor = module,
                 callbackDispatcher = callbackDispatcher,
+                initialToken = authToken,
             )
 
             module?.let {
